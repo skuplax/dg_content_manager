@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """
 Video File Scanner Module
-Scans project folders and creates a CSV with video file information.
+Scans project folders and stores metadata in the catalog database.
 """
 
-import os
-import csv
 import datetime
-from pathlib import Path
 import hashlib
+import os
+from pathlib import Path
+from typing import Any, Dict, List
+
+from database import CatalogDatabase
 
 
 def get_video_extensions():
@@ -91,51 +93,62 @@ def get_file_creation_time(file_path):
         return None
 
 
-def scan_project_folder(root_path, output_csv, skip_hash=False):
-    """Scan the project folder and create CSV with video file information.
+def scan_project_folder(root_path, catalog_db: CatalogDatabase, skip_hash=False):
+    """Scan the project folder and store metadata inside the catalog database.
     
     Assumes structure: root/year/month/month_day/project_name/
     """
-    # CSV headers
-    headers = ['year', 'month', 'month_day', 'project_name', 'video_file_name', 'video_file_size_bytes', 'video_created_at', 'file_hash']
-    
     # Track files by size to detect potential duplicates
-    # Format: {file_size: [{'path': Path, 'hash': str or None, ...}, ...]}
-    files_by_size = {}
+    # Format: {file_size: [{'path': Path, 'hash': str or None, 'file_id': int}, ...]}
+    files_by_size: Dict[int, List[Dict[str, Any]]] = {}
     
-    with open(output_csv, 'w', newline='', encoding='utf-8') as csvfile:
-        writer = csv.writer(csvfile)
-        writer.writerow(headers)
+    root_path = Path(root_path)
+    
+    # Level 1: Year folders
+    for year_folder in root_path.iterdir():
+        if not year_folder.is_dir() or year_folder.name.startswith('.'):
+            continue
+        year = year_folder.name
         
-        root_path = Path(root_path)
-        
-        # Level 1: Year folders
-        for year_folder in root_path.iterdir():
-            if not year_folder.is_dir() or year_folder.name.startswith('.'):
+        # Level 2: Month folders
+        for month_folder in year_folder.iterdir():
+            if not month_folder.is_dir() or month_folder.name.startswith('.'):
                 continue
-            year = year_folder.name
+            month = month_folder.name
             
-            # Level 2: Month folders
-            for month_folder in year_folder.iterdir():
-                if not month_folder.is_dir() or month_folder.name.startswith('.'):
+            # Level 3: Month_day folders
+            for month_day_folder in month_folder.iterdir():
+                if not month_day_folder.is_dir() or month_day_folder.name.startswith('.'):
                     continue
-                month = month_folder.name
+                month_day = month_day_folder.name
                 
-                # Level 3: Month_day folders
-                for month_day_folder in month_folder.iterdir():
-                    if not month_day_folder.is_dir() or month_day_folder.name.startswith('.'):
+                # Level 4: Project folders - scan when found
+                for project_folder in month_day_folder.iterdir():
+                    if not project_folder.is_dir() or project_folder.name.startswith('.'):
                         continue
-                    month_day = month_day_folder.name
-                    
-                    # Level 4: Project folders - scan when found
-                    for project_folder in month_day_folder.iterdir():
-                        if not project_folder.is_dir() or project_folder.name.startswith('.'):
-                            continue
-                        project_name = project_folder.name
-                        scan_videos_in_folder(project_folder, writer, year, month, month_day, project_name, skip_hash, files_by_size)
+                    project_name = project_folder.name
+                    scan_videos_in_folder(
+                        project_folder,
+                        catalog_db,
+                        year,
+                        month,
+                        month_day,
+                        project_name,
+                        skip_hash,
+                        files_by_size,
+                    )
 
 
-def scan_videos_in_folder(folder_path, writer, year, month, month_day, project_name, skip_hash=False, files_by_size=None):
+def scan_videos_in_folder(
+    folder_path,
+    catalog_db: CatalogDatabase,
+    year,
+    month,
+    month_day,
+    project_name,
+    skip_hash=False,
+    files_by_size=None,
+):
     """Scan for video files in a specific folder."""
     if files_by_size is None:
         files_by_size = {}
@@ -160,56 +173,62 @@ def scan_videos_in_folder(folder_path, writer, year, month, month_day, project_n
         video_name = file_path.name
         file_size_bytes = get_file_size_bytes(file_path)
         creation_time = get_file_creation_time(file_path)
+        created_at_iso = creation_time.isoformat() if creation_time else None
         
-        # Determine if we need to calculate hash (only for duplicates)
-        file_hash = None
+        file_id = catalog_db.record_file(
+            original_path=str(file_path),
+            file_name=video_name,
+            file_size_bytes=file_size_bytes,
+            created_at=created_at_iso,
+            year=year,
+            month=month,
+            month_day=month_day,
+            project_name=project_name,
+        )
+        catalog_db.record_path(file_id, str(file_path), path_type="original")
+        
+        if file_size_bytes not in files_by_size:
+            files_by_size[file_size_bytes] = []
+        
+        file_entry = {
+            'path': file_path,
+            'hash': None,
+            'file_id': file_id
+        }
+        files_by_size[file_size_bytes].append(file_entry)
+        
+        file_hash_display = "Skipped" if skip_hash else "No duplicate"
+        
         if not skip_hash:
-            # Check if we've seen a file with the same size (potential duplicate)
-            if file_size_bytes in files_by_size:
-                # Potential duplicate found - calculate multi-chunk hash
-                print(f"  Potential duplicate detected (size match), calculating multi-chunk hash...")
-                file_hash = calculate_file_hash_multi_chunk(file_path)
+            same_size_entries = files_by_size[file_size_bytes]
+            if len(same_size_entries) > 1:
+                print("  Potential duplicate detected (size match), calculating multi-chunk hash...")
+                file_hash_value = calculate_file_hash_multi_chunk(file_path)
+                if file_hash_value not in {"Error", "Skipped"}:
+                    file_entry['hash'] = file_hash_value
+                    catalog_db.update_file_hash(file_id, file_hash_value)
+                    catalog_db.handle_duplicate_hash(file_hash_value)
+                    file_hash_display = file_hash_value
+                else:
+                    file_hash_display = file_hash_value
                 
                 # Also hash the existing file(s) with same size if not already hashed
-                for existing_file in files_by_size[file_size_bytes]:
+                for existing_file in same_size_entries[:-1]:
                     if existing_file['hash'] is None:
                         print(f"  Hashing existing file: {existing_file['path'].name}")
-                        existing_file['hash'] = calculate_file_hash_multi_chunk(existing_file['path'])
+                        existing_hash = calculate_file_hash_multi_chunk(existing_file['path'])
+                        existing_file['hash'] = existing_hash
+                        if existing_hash not in {"Error", "Skipped"}:
+                            catalog_db.update_file_hash(existing_file['file_id'], existing_hash)
+                            catalog_db.handle_duplicate_hash(existing_hash)
             else:
-                # First file with this size - no hash needed yet
-                files_by_size[file_size_bytes] = []
-            
-            # Store this file in the tracking dict
-            file_entry = {
-                'path': file_path,
-                'hash': file_hash
-            }
-            files_by_size[file_size_bytes].append(file_entry)
-            
-            # Set hash display value
-            if file_hash is None:
-                file_hash = "No duplicate"
+                file_hash_display = "No duplicate"
         else:
-            file_hash = "Skipped"
-            print(f"  Skipping hash calculation")
+            print("  Skipping hash calculation")
         
-        # Format creation time
-        if creation_time:
-            created_at = creation_time.strftime('%Y-%m-%d %H:%M:%S')
-        else:
-            created_at = "Unknown"
-        
-        # Write row to CSV
-        writer.writerow([
-            year,
-            month,
-            month_day,
-            project_name,
-            video_name,
-            file_size_bytes,
-            created_at,
-            file_hash
-        ])
-        
-        print(f"  Added to CSV: {video_name} ({file_size_bytes:,} bytes)")
+        created_at_display = creation_time.strftime('%Y-%m-%d %H:%M:%S') if creation_time else "Unknown"
+        print(
+            f"  Added to catalog: {video_name} ({file_size_bytes:,} bytes) | "
+            f"Created: {created_at_display} | Hash: {file_hash_display}"
+        )
 
