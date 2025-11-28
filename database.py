@@ -305,15 +305,18 @@ class CatalogDatabase:
         Returns list of Row objects with id, original_path, file_name, 
         file_size_bytes, and file_hash fields.
         """
-        return self.conn.execute(
-            """
-            SELECT id, original_path, file_name, file_size_bytes, file_hash
-            FROM files
-            WHERE file_size_bytes = ?
-            ORDER BY id ASC;
-            """,
-            (file_size_bytes,),
-        ).fetchall()
+        def _do_query():
+            return self.conn.execute(
+                """
+                SELECT id, original_path, file_name, file_size_bytes, file_hash
+                FROM files
+                WHERE file_size_bytes = ?
+                ORDER BY id ASC;
+                """,
+                (file_size_bytes,),
+            ).fetchall()
+        
+        return self._retry_db_operation(_do_query)
 
     # ------------------------------------------------------------------
     # Hash + duplicate tracking
@@ -323,159 +326,168 @@ class CatalogDatabase:
         if not file_hash or file_hash in {"Error", "Skipped"}:
             return
 
-        self.conn.execute(
-            """
-            UPDATE files
-            SET file_hash = ?, scan_timestamp = ?
-            WHERE id = ?;
-            """,
-            (file_hash, _utc_now(), file_id),
-        )
-        self.conn.commit()
+        def _do_update():
+            self.conn.execute(
+                """
+                UPDATE files
+                SET file_hash = ?, scan_timestamp = ?
+                WHERE id = ?;
+                """,
+                (file_hash, _utc_now(), file_id),
+            )
+            self.conn.commit()
+        
+        self._retry_db_operation(_do_update)
 
     def handle_duplicate_hash(self, file_hash: str) -> None:
         """Update duplicate status and group data for a given hash."""
         if not file_hash or file_hash in {"Error", "Skipped"}:
             return
 
-        rows = self.conn.execute(
-            """
-            SELECT id, file_size_bytes
-            FROM files
-            WHERE file_hash = ?
-            ORDER BY id ASC;
-            """,
-            (file_hash,),
-        ).fetchall()
-
-        if len(rows) <= 1:
-            # No duplicates remain for this hash.
-            self.conn.execute(
-                "DELETE FROM duplicate_groups WHERE group_hash = ?;",
-                (file_hash,),
-            )
-            self.conn.execute(
+        def _do_handle():
+            rows = self.conn.execute(
                 """
-                UPDATE files
-                SET is_duplicate = 0,
-                    master_file_id = NULL
-                WHERE file_hash = ?;
+                SELECT id, file_size_bytes
+                FROM files
+                WHERE file_hash = ?
+                ORDER BY id ASC;
                 """,
                 (file_hash,),
+            ).fetchall()
+
+            if len(rows) <= 1:
+                # No duplicates remain for this hash.
+                self.conn.execute(
+                    "DELETE FROM duplicate_groups WHERE group_hash = ?;",
+                    (file_hash,),
+                )
+                self.conn.execute(
+                    """
+                    UPDATE files
+                    SET is_duplicate = 0,
+                        master_file_id = NULL
+                    WHERE file_hash = ?;
+                    """,
+                    (file_hash,),
+                )
+                self.conn.commit()
+                return
+
+            master_id = rows[0]["id"]
+            total_size = sum(row["file_size_bytes"] for row in rows)
+            master_size = rows[0]["file_size_bytes"]
+            duplicate_count = len(rows) - 1
+            space_saved = total_size - master_size
+
+            self.conn.execute(
+                """
+                INSERT INTO duplicate_groups (
+                    group_hash,
+                    file_size_bytes,
+                    master_file_id,
+                    duplicate_count,
+                    total_size_bytes,
+                    space_saved_bytes
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(group_hash) DO UPDATE SET
+                    master_file_id=excluded.master_file_id,
+                    duplicate_count=excluded.duplicate_count,
+                    total_size_bytes=excluded.total_size_bytes,
+                    space_saved_bytes=excluded.space_saved_bytes;
+                """,
+                (
+                    file_hash,
+                    rows[0]["file_size_bytes"],
+                    master_id,
+                    duplicate_count,
+                    total_size,
+                    space_saved,
+                ),
             )
+
+            for row in rows:
+                is_duplicate = 0 if row["id"] == master_id else 1
+                master_file_id = None if row["id"] == master_id else master_id
+                self.conn.execute(
+                    """
+                    UPDATE files
+                    SET is_duplicate = ?,
+                        master_file_id = ?
+                    WHERE id = ?;
+                    """,
+                    (is_duplicate, master_file_id, row["id"]),
+                )
+
             self.conn.commit()
-            return
-
-        master_id = rows[0]["id"]
-        total_size = sum(row["file_size_bytes"] for row in rows)
-        master_size = rows[0]["file_size_bytes"]
-        duplicate_count = len(rows) - 1
-        space_saved = total_size - master_size
-
-        self.conn.execute(
-            """
-            INSERT INTO duplicate_groups (
-                group_hash,
-                file_size_bytes,
-                master_file_id,
-                duplicate_count,
-                total_size_bytes,
-                space_saved_bytes
-            )
-            VALUES (?, ?, ?, ?, ?, ?)
-            ON CONFLICT(group_hash) DO UPDATE SET
-                master_file_id=excluded.master_file_id,
-                duplicate_count=excluded.duplicate_count,
-                total_size_bytes=excluded.total_size_bytes,
-                space_saved_bytes=excluded.space_saved_bytes;
-            """,
-            (
-                file_hash,
-                rows[0]["file_size_bytes"],
-                master_id,
-                duplicate_count,
-                total_size,
-                space_saved,
-            ),
-        )
-
-        for row in rows:
-            is_duplicate = 0 if row["id"] == master_id else 1
-            master_file_id = None if row["id"] == master_id else master_id
-            self.conn.execute(
-                """
-                UPDATE files
-                SET is_duplicate = ?,
-                    master_file_id = ?
-                WHERE id = ?;
-                """,
-                (is_duplicate, master_file_id, row["id"]),
-            )
-
-        self.conn.commit()
+        
+        self._retry_db_operation(_do_handle)
 
     # ------------------------------------------------------------------
     # Statistics
     # ------------------------------------------------------------------
     def update_statistics(self) -> None:
         """Recalculate and persist aggregate statistics."""
-        stats_cursor = self.conn.cursor()
+        def _do_update():
+            stats_cursor = self.conn.cursor()
 
-        total_files = stats_cursor.execute(
-            "SELECT COUNT(*) AS c FROM files;"
-        ).fetchone()["c"]
+            total_files = stats_cursor.execute(
+                "SELECT COUNT(*) AS c FROM files;"
+            ).fetchone()["c"]
 
-        total_size = stats_cursor.execute(
-            "SELECT COALESCE(SUM(file_size_bytes), 0) AS s FROM files;"
-        ).fetchone()["s"]
+            total_size = stats_cursor.execute(
+                "SELECT COALESCE(SUM(file_size_bytes), 0) AS s FROM files;"
+            ).fetchone()["s"]
 
-        duplicate_files = stats_cursor.execute(
-            "SELECT COUNT(*) AS c FROM files WHERE is_duplicate = 1;"
-        ).fetchone()["c"]
+            duplicate_files = stats_cursor.execute(
+                "SELECT COUNT(*) AS c FROM files WHERE is_duplicate = 1;"
+            ).fetchone()["c"]
 
-        unique_files = total_files - duplicate_files
+            unique_files = total_files - duplicate_files
 
-        duplicate_groups = stats_cursor.execute(
-            "SELECT COUNT(*) AS c FROM duplicate_groups WHERE duplicate_count > 0;"
-        ).fetchone()["c"]
+            duplicate_groups = stats_cursor.execute(
+                "SELECT COUNT(*) AS c FROM duplicate_groups WHERE duplicate_count > 0;"
+            ).fetchone()["c"]
 
-        space_saved = stats_cursor.execute(
-            "SELECT COALESCE(SUM(space_saved_bytes), 0) AS s FROM duplicate_groups;"
-        ).fetchone()["s"]
+            space_saved = stats_cursor.execute(
+                "SELECT COALESCE(SUM(space_saved_bytes), 0) AS s FROM duplicate_groups;"
+            ).fetchone()["s"]
 
-        space_saved_pct = (space_saved / total_size * 100) if total_size else 0
+            space_saved_pct = (space_saved / total_size * 100) if total_size else 0
 
-        last_scan = stats_cursor.execute(
-            "SELECT MAX(scan_timestamp) AS ts FROM files;"
-        ).fetchone()["ts"]
+            last_scan = stats_cursor.execute(
+                "SELECT MAX(scan_timestamp) AS ts FROM files;"
+            ).fetchone()["ts"]
 
-        stats = {
-            "total_files": (total_files, "integer"),
-            "total_size_bytes": (total_size, "integer"),
-            "unique_files": (unique_files, "integer"),
-            "duplicate_files": (duplicate_files, "integer"),
-            "duplicate_groups": (duplicate_groups, "integer"),
-            "space_saved_bytes": (space_saved, "integer"),
-            "space_saved_percentage": (space_saved_pct, "float"),
-            "files_deduplicated": (0, "integer"),
-            "symlinks_created": (0, "integer"),
-            "last_scan_timestamp": (last_scan or "", "datetime"),
-        }
+            stats = {
+                "total_files": (total_files, "integer"),
+                "total_size_bytes": (total_size, "integer"),
+                "unique_files": (unique_files, "integer"),
+                "duplicate_files": (duplicate_files, "integer"),
+                "duplicate_groups": (duplicate_groups, "integer"),
+                "space_saved_bytes": (space_saved, "integer"),
+                "space_saved_percentage": (space_saved_pct, "float"),
+                "files_deduplicated": (0, "integer"),
+                "symlinks_created": (0, "integer"),
+                "last_scan_timestamp": (last_scan or "", "datetime"),
+            }
 
-        now = _utc_now()
-        for name, (value, stat_type) in stats.items():
-            self.conn.execute(
-                """
-                INSERT INTO statistics (stat_name, stat_value, stat_type, updated_at)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(stat_name) DO UPDATE SET
-                    stat_value = excluded.stat_value,
-                    stat_type = excluded.stat_type,
-                    updated_at = excluded.updated_at;
-                """,
-                (name, str(value), stat_type, now),
-            )
+            now = _utc_now()
+            for name, (value, stat_type) in stats.items():
+                self.conn.execute(
+                    """
+                    INSERT INTO statistics (stat_name, stat_value, stat_type, updated_at)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(stat_name) DO UPDATE SET
+                        stat_value = excluded.stat_value,
+                        stat_type = excluded.stat_type,
+                        updated_at = excluded.updated_at;
+                    """,
+                    (name, str(value), stat_type, now),
+                )
 
-        self.conn.commit()
+            self.conn.commit()
+        
+        self._retry_db_operation(_do_update)
 
 
