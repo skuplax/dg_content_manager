@@ -9,9 +9,10 @@ located at <scan_root>/.dg_consolidation by default.
 import sqlite3
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 CONSOLIDATION_DIR_NAME = ".dg_consolidation"
 DB_FILENAME = "dg_catalog.db"
@@ -65,9 +66,12 @@ class CatalogDatabase:
         final_db_path = Path(db_path).resolve() if db_path else hidden_dir / DB_FILENAME
         final_db_path.parent.mkdir(parents=True, exist_ok=True)
 
-        conn = sqlite3.connect(final_db_path)
+        # Add timeout to prevent locking issues (30 seconds)
+        # Enable WAL mode for better concurrency and reliability
+        conn = sqlite3.connect(final_db_path, timeout=30.0)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON;")
+        conn.execute("PRAGMA journal_mode = WAL;")
 
         catalog = cls(conn, final_db_path, hidden_dir)
         catalog._create_tables()
@@ -76,6 +80,37 @@ class CatalogDatabase:
     def close(self) -> None:
         """Close the database connection."""
         self.conn.close()
+
+    def _reconnect(self) -> None:
+        """Recreate the database connection if it's in a bad state."""
+        try:
+            self.conn.close()
+        except Exception:
+            pass
+        self.conn = sqlite3.connect(self.db_path, timeout=30.0)
+        self.conn.row_factory = sqlite3.Row
+        self.conn.execute("PRAGMA foreign_keys = ON;")
+        self.conn.execute("PRAGMA journal_mode = WAL;")
+
+    def _retry_db_operation(self, operation, max_retries=3, retry_delay=0.1):
+        """Retry a database operation if it fails due to locking/timeout issues."""
+        for attempt in range(max_retries):
+            try:
+                return operation()
+            except sqlite3.OperationalError as e:
+                error_str = str(e).lower()
+                if "unable to open database file" in error_str or "database is locked" in error_str:
+                    if attempt < max_retries - 1:
+                        time.sleep(retry_delay * (attempt + 1))  # Exponential backoff
+                        # Check if connection is still valid
+                        try:
+                            self.conn.execute("SELECT 1")
+                        except (sqlite3.OperationalError, sqlite3.ProgrammingError):
+                            # Connection is bad, recreate it
+                            self._reconnect()
+                        continue
+                raise
+        raise
 
     # ------------------------------------------------------------------
     # Table creation
@@ -186,65 +221,99 @@ class CatalogDatabase:
     ) -> int:
         """Insert or update a file record and return its id."""
         scan_ts = _utc_now()
-        cursor = self.conn.execute(
-            """
-            INSERT INTO files (
-                original_path,
-                file_name,
-                file_size_bytes,
-                created_at,
-                year,
-                month,
-                month_day,
-                project_name,
-                scan_timestamp
+        
+        def _do_record():
+            cursor = self.conn.execute(
+                """
+                INSERT INTO files (
+                    original_path,
+                    file_name,
+                    file_size_bytes,
+                    created_at,
+                    year,
+                    month,
+                    month_day,
+                    project_name,
+                    scan_timestamp
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(original_path) DO UPDATE SET
+                    file_name=excluded.file_name,
+                    file_size_bytes=excluded.file_size_bytes,
+                    created_at=excluded.created_at,
+                    year=excluded.year,
+                    month=excluded.month,
+                    month_day=excluded.month_day,
+                    project_name=excluded.project_name,
+                    scan_timestamp=excluded.scan_timestamp;
+                """,
+                (
+                    original_path,
+                    file_name,
+                    file_size_bytes,
+                    created_at,
+                    year,
+                    month,
+                    month_day,
+                    project_name,
+                    scan_ts,
+                ),
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(original_path) DO UPDATE SET
-                file_name=excluded.file_name,
-                file_size_bytes=excluded.file_size_bytes,
-                created_at=excluded.created_at,
-                year=excluded.year,
-                month=excluded.month,
-                month_day=excluded.month_day,
-                project_name=excluded.project_name,
-                scan_timestamp=excluded.scan_timestamp;
-            """,
-            (
-                original_path,
-                file_name,
-                file_size_bytes,
-                created_at,
-                year,
-                month,
-                month_day,
-                project_name,
-                scan_ts,
-            ),
-        )
 
-        if cursor.lastrowid:
-            file_id = cursor.lastrowid
-        else:
-            row = self.conn.execute(
-                "SELECT id FROM files WHERE original_path = ?;",
-                (original_path,),
-            ).fetchone()
-            file_id = row["id"]
+            if cursor.lastrowid:
+                file_id = cursor.lastrowid
+            else:
+                row = self.conn.execute(
+                    "SELECT id FROM files WHERE original_path = ?;",
+                    (original_path,),
+                ).fetchone()
+                file_id = row["id"]
 
-        self.conn.commit()
-        return file_id
+            self.conn.commit()
+            return file_id
+        
+        return self._retry_db_operation(_do_record)
 
     def record_path(self, file_id: int, path: str, path_type: str = "original") -> None:
         """Record a path entry if it doesn't already exist."""
-        self.conn.execute(
+        def _do_record():
+            self.conn.execute(
+                """
+                INSERT OR IGNORE INTO paths (file_id, path_type, path)
+                VALUES (?, ?, ?);
+                """,
+                (file_id, path_type, path),
+            )
+            self.conn.commit()
+        
+        self._retry_db_operation(_do_record)
+
+    def file_exists_by_path(self, original_path: str) -> bool:
+        """Check if a file with this path already exists in the database."""
+        def _do_check():
+            row = self.conn.execute(
+                "SELECT 1 FROM files WHERE original_path = ? LIMIT 1;",
+                (original_path,),
+            ).fetchone()
+            return row is not None
+        
+        return self._retry_db_operation(_do_check)
+
+    def find_files_by_size(self, file_size_bytes: int) -> List:
+        """Query database for all files with the same size.
+        
+        Returns list of Row objects with id, original_path, file_name, 
+        file_size_bytes, and file_hash fields.
+        """
+        return self.conn.execute(
             """
-            INSERT OR IGNORE INTO paths (file_id, path_type, path)
-            VALUES (?, ?, ?);
+            SELECT id, original_path, file_name, file_size_bytes, file_hash
+            FROM files
+            WHERE file_size_bytes = ?
+            ORDER BY id ASC;
             """,
-            (file_id, path_type, path),
-        )
-        self.conn.commit()
+            (file_size_bytes,),
+        ).fetchall()
 
     # ------------------------------------------------------------------
     # Hash + duplicate tracking
