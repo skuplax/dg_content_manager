@@ -87,27 +87,57 @@ class CatalogDatabase:
             self.conn.close()
         except Exception:
             pass
+        
+        # Ensure the database directory exists
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Small delay to allow filesystem to stabilize
+        time.sleep(0.1)
+        
         self.conn = sqlite3.connect(self.db_path, timeout=30.0)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys = ON;")
         self.conn.execute("PRAGMA journal_mode = WAL;")
 
-    def _retry_db_operation(self, operation, max_retries=3, retry_delay=0.1):
+    def _retry_db_operation(self, operation, max_retries=5, retry_delay=0.5):
         """Retry a database operation if it fails due to locking/timeout issues."""
         for attempt in range(max_retries):
             try:
                 return operation()
-            except sqlite3.OperationalError as e:
+            except (sqlite3.OperationalError, sqlite3.DatabaseError) as e:
                 error_str = str(e).lower()
-                if "unable to open database file" in error_str or "database is locked" in error_str:
+                # Check for various database connection/locking errors
+                is_retryable = (
+                    "unable to open database file" in error_str or
+                    "database is locked" in error_str or
+                    "database disk image is malformed" in error_str or
+                    "no such table" in error_str  # In case connection was lost during table creation
+                )
+                
+                if is_retryable:
                     if attempt < max_retries - 1:
-                        time.sleep(retry_delay * (attempt + 1))  # Exponential backoff
-                        # Check if connection is still valid
-                        try:
-                            self.conn.execute("SELECT 1")
-                        except (sqlite3.OperationalError, sqlite3.ProgrammingError):
-                            # Connection is bad, recreate it
+                        # Always reconnect on "unable to open database file" errors
+                        if "unable to open database file" in error_str:
                             self._reconnect()
+                        else:
+                            # For other errors, check connection first
+                            try:
+                                self.conn.execute("SELECT 1")
+                            except (sqlite3.OperationalError, sqlite3.ProgrammingError, sqlite3.DatabaseError):
+                                # Connection is bad, recreate it
+                                self._reconnect()
+                        
+                        # Exponential backoff with longer delays
+                        time.sleep(retry_delay * (2 ** attempt))
+                        continue
+                raise
+            except Exception as e:
+                # For any other exception, check if it's connection-related
+                error_str = str(e).lower()
+                if "unable to open" in error_str or "database" in error_str:
+                    if attempt < max_retries - 1:
+                        self._reconnect()
+                        time.sleep(retry_delay * (2 ** attempt))
                         continue
                 raise
         raise

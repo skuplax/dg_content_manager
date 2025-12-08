@@ -8,6 +8,8 @@ CLI utility that walks a structured project tree (year/month/day/project) and ca
 - Access to the storage volume you want to scan
 
 ## Quick Start
+
+### Basic Scanning
 ```bash
 cd /path/to/dg_content_manager
 python3 main.py /Volumes/your_volume/your_project_root
@@ -19,28 +21,97 @@ What happens:
 3. Every nested project folder is scanned recursively for common video extensions.
 4. File metadata is written to the `files` and `paths` tables, duplicate groups are tracked, and aggregate statistics are refreshed.
 
+### Generate a Report
+```bash
+# Using root_path (will locate database automatically)
+python3 main.py /Volumes/your_volume/your_project_root --report
+
+# Using explicit database path
+python3 main.py --db-path /path/to/dg_catalog.db --report
+```
+
 ## CLI Options
+
+### Scanning Options
 | Flag | Description |
 | --- | --- |
-| `root_path` | Required. Root directory to scan. Should contain year/month/day/project folders. |
+| `root_path` | Root directory to scan. Required for scanning (unless using `--report` with `--db-path`). Should contain year/month/day/project folders. |
 | `--consolidation-root PATH` | Puts the hidden `.dg_consolidation` folder somewhere else (e.g., another volume). Defaults to `root_path`. |
 | `--db-path PATH` | Override the exact SQLite file location. Useful for debugging or sharing a catalog snapshot. |
 | `--skip-hash` | Skip the multi-chunk MD5 hashing pass. Scanning is faster but duplicates are only flagged by size. |
+| `--subfolder PATH` | Limit scan to a specific subfolder relative to root_path (e.g., `2025/october`). Useful for incremental scanning. |
+
+### Report Options
+| Flag | Description |
+| --- | --- |
+| `--report` | Generate and display a markdown report from the database. Exits without scanning. Requires either `root_path` or `--db-path` to locate the database. |
+
+## Usage Examples
+
+### Scan a Full Project Tree
+```bash
+python3 main.py /Volumes/digitalcatalyst/digitalcatalyst/Project\ Folder
+```
+
+### Scan Only a Specific Month
+```bash
+python3 main.py /Volumes/digitalcatalyst/digitalcatalyst/Project\ Folder --subfolder 2025/october
+```
+
+### Fast Scan Without Hashing (Initial Pass)
+```bash
+python3 main.py /Volumes/digitalcatalyst/digitalcatalyst/Project\ Folder --skip-hash
+```
+
+### Generate Report After Scanning
+```bash
+# Generate report using root path
+python3 main.py /Volumes/digitalcatalyst/digitalcatalyst/Project\ Folder --report
+
+# Generate report using explicit database path
+python3 main.py --db-path /Volumes/digitalcatalyst/.dg_consolidation/dg_catalog.db --report
+```
+
+### Custom Database Location
+```bash
+python3 main.py /Volumes/digitalcatalyst/digitalcatalyst/Project\ Folder --db-path /tmp/my_catalog.db
+```
+
+### Consolidation Folder on Different Volume
+```bash
+python3 main.py /Volumes/source/Project\ Folder --consolidation-root /Volumes/destination
+```
 
 ## Outputs to Know About
 - **Hidden catalog folder**: `<consolidation-root>/.dg_consolidation/`
 - **Database**: `dg_catalog.db` with `files`, `paths`, `duplicate_groups`, and `statistics` tables
 - **Console logs**: Running progress (files found, hashes, duplicate alerts, summary)
+- **Reports**: Markdown reports with comprehensive statistics, breakdowns by year/month, top projects, and deduplication metrics
 
 ### Duplicate Tracking
 - Files are first grouped by size to avoid unnecessary hashing.
 - When two files share a size, the scanner hashes the first, middle, and last KB, combines those hashes, and compares the result.
 - Duplicates are marked in `files.is_duplicate`, grouped in `duplicate_groups`, and stats such as `space_saved_bytes` are updated.
 
+### Report Generation
+The `--report` flag generates a comprehensive markdown report including:
+- Executive summary with totals and percentages
+- Detailed statistics (file counts, sizes, duplicates)
+- Breakdown by year and month
+- Top 10 projects by file count and total size
+- Deduplication status breakdown
+
+Reports can be generated without scanning by providing either:
+- `root_path` (will automatically locate the database in `.dg_consolidation/dg_catalog.db`)
+- `--db-path` pointing directly to the database file
+
 ## Operational Tips
 - Run from a machine that can maintain stable access to the storage volume; hashing large files over flaky links will slow things down.
 - Keep the `.dg_consolidation` folder with the volume so that catalog paths remain valid.
 - Re-run the scanner after ingesting new footage; existing rows are updated in place, so repeat scans are safe.
+- Use `--subfolder` for incremental scanning of specific months or date ranges.
+- Use `--skip-hash` for initial fast scans, then re-run without it to identify duplicates precisely.
+- Generate reports regularly to track catalog growth and duplicate statistics.
 - If you only need a metadata snapshot (e.g., for reporting), point `--db-path` at a temp location and copy that SQLite file elsewhere.
 
 ## Troubleshooting
