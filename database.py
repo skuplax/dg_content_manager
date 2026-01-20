@@ -454,8 +454,202 @@ class CatalogDatabase:
         self._retry_db_operation(_do_handle)
 
     # ------------------------------------------------------------------
+    # Deduplication methods
+    # ------------------------------------------------------------------
+    def get_files_for_deduplication(self) -> List:
+        """Get all files that need deduplication processing.
+        
+        Returns list of Row objects for files where deduplication_status = 'not_processed'.
+        Includes both unique files and master files from duplicate groups.
+        """
+        def _do_query():
+            return self.conn.execute(
+                """
+                SELECT id, original_path, file_name, file_size_bytes, file_hash,
+                       is_duplicate, master_file_id, deduplication_status
+                FROM files
+                WHERE deduplication_status = 'not_processed'
+                ORDER BY id ASC;
+                """
+            ).fetchall()
+        
+        return self._retry_db_operation(_do_query)
+    
+    def get_duplicate_group_files(self, group_hash: str) -> List:
+        """Get all files in a duplicate group by group hash.
+        
+        Returns list of Row objects with id, original_path, file_name, 
+        is_duplicate, master_file_id, file_hash, and deduplication_status.
+        """
+        def _do_query():
+            return self.conn.execute(
+                """
+                SELECT id, original_path, file_name, file_size_bytes, file_hash,
+                       is_duplicate, master_file_id, deduplication_status
+                FROM files
+                WHERE file_hash = ?
+                ORDER BY id ASC;
+                """,
+                (group_hash,),
+            ).fetchall()
+        
+        return self._retry_db_operation(_do_query)
+    
+    def get_duplicate_groups_for_processing(self) -> List:
+        """Get all duplicate groups that need processing.
+        
+        Returns list of Row objects with id, group_hash, master_file_id, 
+        duplicate_count, and deduplicated_at.
+        """
+        def _do_query():
+            return self.conn.execute(
+                """
+                SELECT id, group_hash, master_file_id, duplicate_count, deduplicated_at
+                FROM duplicate_groups
+                WHERE duplicate_count > 0
+                ORDER BY id ASC;
+                """
+            ).fetchall()
+        
+        return self._retry_db_operation(_do_query)
+    
+    def consolidated_path_exists(self, consolidated_path: str) -> bool:
+        """Check if a consolidated path already exists in the database."""
+        def _do_check():
+            row = self.conn.execute(
+                """
+                SELECT 1 FROM paths 
+                WHERE path_type = 'consolidated' AND path = ?
+                LIMIT 1;
+                """,
+                (consolidated_path,),
+            ).fetchone()
+            return row is not None
+        
+        return self._retry_db_operation(_do_check)
+    
+    def update_consolidated_path(self, file_id: int, consolidated_path: str) -> None:
+        """Record consolidated path in paths table."""
+        def _do_update():
+            self.conn.execute(
+                """
+                INSERT OR IGNORE INTO paths (file_id, path_type, path)
+                VALUES (?, 'consolidated', ?);
+                """,
+                (file_id, consolidated_path),
+            )
+            self.conn.commit()
+        
+        self._retry_db_operation(_do_update)
+    
+    def update_symlink_path(self, file_id: int, symlink_path: str) -> None:
+        """Record symlink path in paths table."""
+        def _do_update():
+            self.conn.execute(
+                """
+                INSERT OR IGNORE INTO paths (file_id, path_type, path)
+                VALUES (?, 'symlink', ?);
+                """,
+                (file_id, symlink_path),
+            )
+            self.conn.commit()
+        
+        self._retry_db_operation(_do_update)
+    
+    def mark_deduplicated(self, file_id: int, status: str = 'deduplicated') -> None:
+        """Update deduplication_status and deduplication_timestamp for a file."""
+        def _do_update():
+            self.conn.execute(
+                """
+                UPDATE files
+                SET deduplication_status = ?,
+                    deduplication_timestamp = ?
+                WHERE id = ?;
+                """,
+                (status, _utc_now(), file_id),
+            )
+            self.conn.commit()
+        
+        self._retry_db_operation(_do_update)
+    
+    def update_group_deduplicated(self, group_hash: str) -> None:
+        """Set deduplicated_at timestamp in duplicate_groups table."""
+        def _do_update():
+            self.conn.execute(
+                """
+                UPDATE duplicate_groups
+                SET deduplicated_at = ?
+                WHERE group_hash = ?;
+                """,
+                (_utc_now(), group_hash),
+            )
+            self.conn.commit()
+        
+        self._retry_db_operation(_do_update)
+    
+    def get_master_file_path(self, file_id: int) -> Optional[str]:
+        """Get the consolidated path for a master file, or None if not found."""
+        def _do_query():
+            row = self.conn.execute(
+                """
+                SELECT path FROM paths
+                WHERE file_id = ? AND path_type = 'consolidated'
+                LIMIT 1;
+                """,
+                (file_id,),
+            ).fetchone()
+            return row["path"] if row else None
+        
+        return self._retry_db_operation(_do_query)
+    
+    def update_deduplication_statistics(self, files_consolidated: int, symlinks_created: int, files_deduplicated: int) -> None:
+        """Update deduplication statistics in statistics table."""
+        def _do_update():
+            now = _utc_now()
+            
+            # Update or insert statistics
+            stats = {
+                "files_consolidated": (files_consolidated, "integer"),
+                "symlinks_created": (symlinks_created, "integer"),
+                "files_deduplicated": (files_deduplicated, "integer"),
+            }
+            
+            for name, (value, stat_type) in stats.items():
+                self.conn.execute(
+                    """
+                    INSERT INTO statistics (stat_name, stat_value, stat_type, updated_at)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(stat_name) DO UPDATE SET
+                        stat_value = excluded.stat_value,
+                        stat_type = excluded.stat_type,
+                        updated_at = excluded.updated_at;
+                    """,
+                    (name, str(value), stat_type, now),
+                )
+            
+            self.conn.commit()
+        
+        self._retry_db_operation(_do_update)
+
+    # ------------------------------------------------------------------
     # Statistics
     # ------------------------------------------------------------------
+    def _get_stat_value(self, stat_name: str, default: int = 0) -> int:
+        """Get a statistic value from the database, returning default if not found."""
+        def _do_query():
+            row = self.conn.execute(
+                "SELECT stat_value FROM statistics WHERE stat_name = ?;",
+                (stat_name,),
+            ).fetchone()
+            if row:
+                try:
+                    return int(row["stat_value"])
+                except (ValueError, TypeError):
+                    return default
+            return default
+        
+        return self._retry_db_operation(_do_query)
+    
     def update_statistics(self) -> None:
         """Recalculate and persist aggregate statistics."""
         def _do_update():
@@ -497,8 +691,9 @@ class CatalogDatabase:
                 "duplicate_groups": (duplicate_groups, "integer"),
                 "space_saved_bytes": (space_saved, "integer"),
                 "space_saved_percentage": (space_saved_pct, "float"),
-                "files_deduplicated": (0, "integer"),
-                "symlinks_created": (0, "integer"),
+                "files_deduplicated": (self._get_stat_value("files_deduplicated", 0), "integer"),
+                "symlinks_created": (self._get_stat_value("symlinks_created", 0), "integer"),
+                "files_consolidated": (self._get_stat_value("files_consolidated", 0), "integer"),
                 "last_scan_timestamp": (last_scan or "", "datetime"),
             }
 

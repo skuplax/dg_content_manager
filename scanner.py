@@ -213,6 +213,9 @@ def scan_videos_in_folder(
     try:
         for file_path in folder_path.rglob('*'):
             try:
+                # Skip symlinks - they're already deduplicated and in the database
+                if file_path.is_symlink():
+                    continue
                 if file_path.is_file() and file_path.suffix.lower() in video_extensions:
                     video_files.append(file_path)
             except OSError as e:

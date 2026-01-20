@@ -249,7 +249,19 @@ class ReportGenerator:
         report.append(f"- **Total Storage**: {format_bytes(total_size)}")
         report.append(f"- **Space Saved (Deduplication)**: {format_bytes(space_saved_bytes)} ({space_saved_pct:.2f}%)")
         report.append(f"- **Duplicate Groups**: {duplicate_groups:,}")
-        report.append(f"- **Average File Size**: {format_bytes(avg_file_size)}\n")
+        report.append(f"- **Average File Size**: {format_bytes(avg_file_size)}")
+        
+        # Deduplication statistics
+        files_consolidated = self._get_deduplication_stat("files_consolidated", 0)
+        symlinks_created = self._get_deduplication_stat("symlinks_created", 0)
+        files_deduplicated = self._get_deduplication_stat("files_deduplicated", 0)
+        
+        if files_deduplicated > 0:
+            report.append(f"- **Files Consolidated**: {files_consolidated:,}")
+            report.append(f"- **Symlinks Created**: {symlinks_created:,}")
+            report.append(f"- **Files Deduplicated**: {files_deduplicated:,}")
+        
+        report.append("")
         
         # Detailed Statistics
         report.append("## Detailed Statistics\n")
@@ -267,7 +279,19 @@ class ReportGenerator:
         report.append(f"|--------|-------|")
         report.append(f"| Duplicate Groups | {duplicate_groups:,} |")
         report.append(f"| Space Saved | {format_bytes(space_saved_bytes)} |")
-        report.append(f"| Space Saved Percentage | {space_saved_pct:.2f}% |\n")
+        report.append(f"| Space Saved Percentage | {space_saved_pct:.2f}% |")
+        
+        # Add deduplication progress if available
+        files_consolidated = self._get_deduplication_stat("files_consolidated", 0)
+        symlinks_created = self._get_deduplication_stat("symlinks_created", 0)
+        files_deduplicated = self._get_deduplication_stat("files_deduplicated", 0)
+        
+        if files_deduplicated > 0:
+            report.append(f"| Files Consolidated | {files_consolidated:,} |")
+            report.append(f"| Symlinks Created | {symlinks_created:,} |")
+            report.append(f"| Files Deduplicated | {files_deduplicated:,} |")
+        
+        report.append("")
         
         # Breakdown by Year
         year_breakdown = self.get_breakdown_by_year()
@@ -337,4 +361,17 @@ class ReportGenerator:
         """Get current timestamp as formatted string."""
         from datetime import datetime
         return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    def _get_deduplication_stat(self, stat_name: str, default: int = 0) -> int:
+        """Get a deduplication statistic value from the database."""
+        try:
+            row = self.db.conn.execute(
+                "SELECT stat_value FROM statistics WHERE stat_name = ?;",
+                (stat_name,),
+            ).fetchone()
+            if row:
+                return int(row["stat_value"])
+        except (ValueError, TypeError):
+            pass
+        return default
 
