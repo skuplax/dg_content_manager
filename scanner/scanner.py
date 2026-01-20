@@ -4,93 +4,16 @@ Video File Scanner Module
 Scans project folders and stores metadata in the catalog database.
 """
 
-import datetime
-import hashlib
-import os
 from pathlib import Path
 from typing import Any, Dict, List
 
+from config import VIDEO_EXTENSIONS
 from database import CatalogDatabase
-
-
-def get_video_extensions():
-    """Return a set of common video file extensions."""
-    return {
-        '.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv', '.webm', '.m4v',
-        '.3gp', '.ogv', '.mts', '.m2ts', '.ts', '.vob', '.asf', '.rm',
-        '.rmvb', '.divx', '.xvid', '.mpg', '.mpeg', '.m2v', '.mpe'
-    }
-
-
-def get_file_size_bytes(file_path):
-    """Get file size in bytes."""
-    try:
-        return os.path.getsize(file_path)
-    except OSError:
-        return 0
-
-
-def calculate_file_hash_multi_chunk(file_path):
-    """Calculate MD5 hash using multi-chunk approach for duplicate detection.
-    
-    For files < 5KB: hash the entire file.
-    For files >= 5KB: hash first 1KB, last 1KB, and middle 1KB, then combine.
-    """
-    CHUNK_SIZE = 1024  # 1KB
-    MIN_SIZE_FOR_MULTI_CHUNK = 5120  # 5KB
-    
-    try:
-        file_size = os.path.getsize(file_path)
-        
-        # For files smaller than 5KB, hash the entire file
-        if file_size < MIN_SIZE_FOR_MULTI_CHUNK:
-            hash_md5 = hashlib.md5()
-            with open(file_path, "rb") as f:
-                hash_md5.update(f.read())
-            return hash_md5.hexdigest()
-        
-        # For files >= 5KB, hash three chunks: first, middle, last
-        with open(file_path, "rb") as f:
-            # Hash first 1KB
-            first_chunk = f.read(CHUNK_SIZE)
-            first_hash = hashlib.md5(first_chunk).hexdigest()
-            
-            # Hash last 1KB
-            f.seek(-CHUNK_SIZE, os.SEEK_END)
-            last_chunk = f.read(CHUNK_SIZE)
-            last_hash = hashlib.md5(last_chunk).hexdigest()
-            
-            # Hash middle 1KB (from the middle position)
-            middle_position = file_size // 2
-            f.seek(middle_position - CHUNK_SIZE // 2)
-            middle_chunk = f.read(CHUNK_SIZE)
-            middle_hash = hashlib.md5(middle_chunk).hexdigest()
-            
-            # Combine all three hashes by concatenating and hashing the result
-            combined = first_hash + middle_hash + last_hash
-            final_hash = hashlib.md5(combined.encode()).hexdigest()
-            
-            return final_hash
-        
-    except (OSError, IOError) as e:
-        print(f"  Error calculating hash: {e}")
-        return "Error"
-
-
-def get_file_creation_time(file_path):
-    """Get file creation time."""
-    try:
-        stat = os.stat(file_path)
-        # Try to get creation time (works on macOS)
-        if hasattr(stat, 'st_birthtime'):
-            creation_time = stat.st_birthtime
-        else:
-            # Fallback to modification time
-            creation_time = stat.st_mtime
-        
-        return datetime.datetime.fromtimestamp(creation_time)
-    except OSError:
-        return None
+from scanner.hashing import (
+    calculate_file_hash_multi_chunk,
+    get_file_creation_time,
+    get_file_size_bytes,
+)
 
 
 def scan_project_folder(root_path, catalog_db: CatalogDatabase, skip_hash=False, subfolder=None):
@@ -206,7 +129,6 @@ def scan_videos_in_folder(
     if files_by_size is None:
         files_by_size = {}
     
-    video_extensions = get_video_extensions()
     video_files = []
     
     # First, collect all video files
@@ -216,7 +138,7 @@ def scan_videos_in_folder(
                 # Skip symlinks - they're already deduplicated and in the database
                 if file_path.is_symlink():
                     continue
-                if file_path.is_file() and file_path.suffix.lower() in video_extensions:
+                if file_path.is_file() and file_path.suffix.lower() in VIDEO_EXTENSIONS:
                     video_files.append(file_path)
             except OSError as e:
                 # Handle files with names too long (errno 63 on macOS)
@@ -393,4 +315,3 @@ def scan_videos_in_folder(
                 print(f"  Error: File name/path too long - skipping this file")
                 continue
             raise
-

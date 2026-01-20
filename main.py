@@ -9,7 +9,7 @@ import os
 from pathlib import Path
 
 from database import CatalogDatabase
-from deduplicator import Deduplicator
+from deduplication import Deduplicator
 from reports import ReportGenerator
 from scanner import scan_project_folder
 
@@ -90,6 +90,19 @@ def main():
             generator = ReportGenerator(catalog_db)
             report = generator.generate_report()
             print(report)
+            
+            # Save report to .data/ directory
+            from datetime import datetime
+            data_dir = Path(".data")
+            data_dir.mkdir(exist_ok=True)
+            
+            timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            report_filename = data_dir / f"report_{timestamp}.md"
+            
+            with open(report_filename, 'w', encoding='utf-8') as f:
+                f.write(report)
+            
+            print(f"\nReport saved to: {report_filename}")
             return 0
         except Exception as e:
             print(f"Error generating report: {e}")

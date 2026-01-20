@@ -70,12 +70,6 @@ class Deduplicator:
                 print(f"  Warning: Master file not found for group {group['id']}")
                 continue
             
-            # #region agent log
-            import json
-            with open('/Users/skayflakes/dev/dg_content_manager/.cursor/debug.log', 'a') as f:
-                f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"A","location":"deduplicator.py:73","message":"Checking master_file type and deduplication_status","data":{"type":str(type(master_file)),"has_get":hasattr(master_file,'get'),"keys":list(master_file.keys()) if hasattr(master_file,'keys') else None,"dedup_status_raw":master_file['deduplication_status'] if 'deduplication_status' in master_file.keys() else 'KEY_MISSING'},"timestamp":__import__('time').time()})+'\n')
-            # #endregion
-            
             # Get or consolidate master file (handles already-consolidated case)
             master_consolidated_path = self._consolidate_master_file(master_file)
             if not master_consolidated_path:
@@ -380,4 +374,3 @@ class Deduplicator:
         
         if self.dry_run:
             print("\n[DRY RUN] No actual changes were made")
-
