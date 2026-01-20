@@ -64,7 +64,7 @@ python3 main.py /Volumes/digitalcatalyst/digitalcatalyst/Project\ Folder
 python3 main.py /Volumes/digitalcatalyst/digitalcatalyst/Project\ Folder --subfolder 2025/october
 ```
 
-### Fast Scan Without Hashing (Initial Pass)
+### Deprecated - Fast Scan Without Hashing (Initial Pass) 
 ```bash
 python3 main.py /Volumes/digitalcatalyst/digitalcatalyst/Project\ Folder --skip-hash
 ```
