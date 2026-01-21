@@ -255,17 +255,39 @@ class Deduplicator:
             return True
         
         try:
-            # Calculate relative path if possible
+            # Resolve both paths to absolute to ensure we have real filesystem paths
+            # This is important for cross-platform compatibility on network shares
             try:
-                relative_path = os.path.relpath(master_path, original_path.parent)
-                # Use relative if it's shorter and doesn't go up too many levels
-                if len(relative_path) < len(str(master_path)) and relative_path.count('..') < 10:
-                    symlink_target = relative_path
-                else:
-                    symlink_target = str(master_path)
-            except (ValueError, OSError):
-                # Can't compute relative path (different drives on Windows, etc.)
-                symlink_target = str(master_path)
+                original_path_resolved = original_path.resolve()
+                master_path_resolved = master_path.resolve()
+            except (OSError, RuntimeError) as e:
+                # If resolution fails, we can't reliably create a cross-platform symlink
+                print(f"  SKIPPED: Cannot resolve paths for {original_path.name}: {e}")
+                print(f"           Cannot create cross-platform compatible symlink")
+                self.stats['errors'].append(f"Cannot resolve paths for {original_path}: {e}")
+                return False
+
+            # Require relative paths for cross-platform compatibility
+            # Relative paths work on network shares accessed from different OSes
+            # Skip deduplication if we can't create a relative path
+            try:
+                relative_path = os.path.relpath(master_path_resolved, original_path_resolved.parent)
+                # Check if relative path is reasonable (not too many levels up)
+                if relative_path.count('..') >= 20:
+                    # Too many levels up - skip to avoid cross-platform issues
+                    print(f"  SKIPPED: Relative path too deep ({relative_path.count('..')} levels) for {original_path.name}")
+                    print(f"           Cannot create cross-platform compatible symlink")
+                    self.stats['errors'].append(f"Relative path too deep for {original_path}: {relative_path.count('..')} levels")
+                    return False
+                
+                # Use relative path - this ensures cross-platform compatibility
+                symlink_target = relative_path
+            except (ValueError, OSError) as e:
+                # Can't compute relative path (different drives, etc.) - skip deduplication
+                print(f"  SKIPPED: Cannot compute relative path for {original_path.name}: {e}")
+                print(f"           Cannot create cross-platform compatible symlink")
+                self.stats['errors'].append(f"Cannot compute relative path for {original_path}: {e}")
+                return False
             
             # Remove original file and create symlink
             original_path.unlink()
@@ -277,7 +299,7 @@ class Deduplicator:
             
             self.stats['symlinks_created'] += 1
             self.stats['files_deduplicated'] += 1
-            print(f"  Created symlink: {original_path.name}")
+            print(f"  Created symlink: {original_path.name} -> {symlink_target}")
             return True
         
         except OSError as e:
